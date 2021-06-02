@@ -26,6 +26,7 @@ using namespace Legion::Mapping;
 enum TaskIDs {
   TOP_LEVEL_TASK_ID,
   FILL_PART_TASK_ID,
+  FILL_META_TASK_ID,
   FILL_TASK_ID,
   CHECK_TASK_ID,
 };
@@ -39,6 +40,7 @@ enum FieldIDs {
 // Globals
 MPILegionHandshake handshake;
 int num_cpus = 0;
+size_t max_size =0;
 
 //-------------------------------------------------------------------------
 // top level task
@@ -66,10 +68,11 @@ top_level_task(const Task * task,
   const size_t num_ghosts = 2;
   const size_t num_colors = num_cpus;
 
+  std::cout <<"NUM COLORS = "<<num_colors<<std::endl;
+
   Rect<1> color_bounds(0, num_colors - 1);
   IndexSpaceT<1> color_is = runtime->create_index_space(ctx, color_bounds);
-
-  size_t max_size = size_t(-1) / (num_colors * sizeof(int));
+  max_size = size_t(-1) / (num_colors * sizeof(int));
 
   ///////////////////////////////////////////////////////////////////////////
   // Creating Logical regions and partitions of these regions for src and dst
@@ -79,6 +82,7 @@ top_level_task(const Task * task,
     Legion::Point<2>(0, 0), Legion::Point<2>(num_colors - 1, max_size - 1));
 
   IndexSpace is_blis = runtime->create_index_space(ctx, rect_blis);
+  runtime->attach_name(is_blis, "blis_is");
 
   FieldSpace fs_blis = runtime->create_field_space(ctx);
   {
@@ -87,6 +91,7 @@ top_level_task(const Task * task,
   }
 
   LogicalRegion lr_blis = runtime->create_logical_region(ctx, is_blis, fs_blis);
+  runtime->attach_name(lr_blis, "lr_blis");
 
  //-------------------------------------------------
  //create used/unused disjoint complete partitioning
@@ -97,12 +102,14 @@ top_level_task(const Task * task,
   Rect<2> rect_part(
     Legion::Point<2>(0, 0), Legion::Point<2>(num_colors - 1, 1));
   IndexSpaceT<2> is_part = runtime->create_index_space(ctx, rect_part); 
+  runtime->attach_name(is_part, "is_part");
   FieldSpace fs_part = runtime->create_field_space(ctx);
   {
     FieldAllocator allocator = runtime->create_field_allocator(ctx, fs_part);
     allocator.allocate_field(sizeof(Legion::Rect<2>), FID_RECT);
   }
   LogicalRegion lr_part = runtime->create_logical_region(ctx, is_part, fs_part);  
+  runtime->attach_name(lr_part, "lr_part");
   // partition lr_part by rows;
 
   Legion::Transform<2, 1> idx_tsfm;
@@ -113,11 +120,13 @@ top_level_task(const Task * task,
     is_part,
     color_is,
     idx_tsfm,
-    {{0,0}, {0,1}});
+    {{0,0}, {0,1}}, DISJOINT_COMPLETE_KIND);
+  runtime->attach_name(ip_part, "ip_part");
   LogicalPartition lp_part = runtime->get_logical_partition(lr_part, ip_part);
+  runtime->attach_name(lp_part, "lp_part");
 
   // fill logical region that stores information about partitioning
-  printf("Filling partition information topology sizes...\n");
+  printf("Filling partition information...\n");
   ArgumentMap idx_arg_map;
   IndexLauncher part_init_launcher(FILL_PART_TASK_ID, color_bounds,
                               TaskArgument(NULL, 0), idx_arg_map);
@@ -126,28 +135,88 @@ top_level_task(const Task * task,
   part_init_launcher.region_requirements[0].add_field(FID_RECT);
   runtime->execute_index_space(ctx, part_init_launcher);
 
+ //----------------------------------------------------------------------
+ // create and fill 2xcolors meta region
+ // ---------------------------------------------------------------------
+  Rect<2> rect_meta(
+    Legion::Point<2>(0, 0), Legion::Point<2>(1, num_colors-1));
+  IndexSpaceT<2> is_meta = runtime->create_index_space(ctx, rect_meta);
+  runtime->attach_name(is_meta, "is_meta");
+  FieldSpace fs_meta = runtime->create_field_space(ctx);
+  {
+    FieldAllocator allocator = runtime->create_field_allocator(ctx, fs_meta);
+    allocator.allocate_field(sizeof(Legion::Rect<2>), FID_RECT);
+  }
+  LogicalRegion lr_meta = runtime->create_logical_region(ctx, is_meta, fs_meta);
+  runtime->attach_name(lr_meta, "lr_meta");
+
+  Rect<1> color_meta_bounds(0, 1);
+  IndexSpaceT<1> color_meta_is = runtime->create_index_space(ctx,
+		color_meta_bounds);
+
+
+  IndexPartition ip_meta = runtime->create_partition_by_restriction
+    (ctx,
+    is_meta,
+    color_meta_is,
+    idx_tsfm,
+    {{0,0}, {0,num_colors-1}}, DISJOINT_COMPLETE_KIND);
+  runtime->attach_name(ip_meta, "ip_meta");
+  LogicalPartition lp_meta = runtime->get_logical_partition(lr_meta, ip_meta);
+  runtime->attach_name(lp_meta, "lp_part");
+
+
+  // fill logical meta region that stores information about partitioning
+  printf("Filling meta information ...\n");
+  IndexLauncher part_meta_launcher(FILL_META_TASK_ID, color_meta_bounds,
+                              TaskArgument(NULL, 0), idx_arg_map);
+  part_meta_launcher.add_region_requirement(
+      RegionRequirement(lp_meta, 0, WRITE_DISCARD, EXCLUSIVE, lr_meta));
+  part_meta_launcher.region_requirements[0].add_field(FID_RECT);
+  runtime->execute_index_space(ctx, part_meta_launcher);
+
+  //partition lp_part by used and unused
+  IndexPartition ip_part_dc = runtime->create_partition_by_image_range(
+      ctx,
+      is_part,
+      lp_meta,
+      lr_meta,//runtime->get_parent_logical_region(idx_lp),
+      FID_RECT,
+      color_meta_is,
+      DISJOINT_COMPLETE_KIND);
+  runtime->attach_name(ip_part_dc, "ip_part_dc");
+  LogicalPartition lp_part_dc = runtime->get_logical_partition(lr_part, ip_part_dc);
+  runtime->attach_name(lp_part_dc, "lp_part_dc");
+
+
+
   // Create partition of the extended index space based on the regions
   // This is used/unused DISJOINT COMPLETE PARTITION
   IndexPartition ip_dc = runtime->create_partition_by_image_range(
       ctx,
       is_blis,
-      lp_part,
+      lp_part_dc,
       lr_part,//runtime->get_parent_logical_region(idx_lp),
       FID_RECT,
-      color_is,
-      DISJOINT_COMPLETE_KIND);
+      color_meta_is);
+  //    DISJOINT_COMPLETE_KIND);
+      
+  runtime->attach_name(ip_dc, "ip_dc");
   LogicalPartition lp_dc = runtime->get_logical_partition(lr_blis, ip_dc);
+  runtime->attach_name(lp_dc, "lp_dc");
 
   //----------------
-  //check the pertition
+  //check the partition
   //-----------------
+#if 0
 
   IndexLauncher check_init_launcher(CHECK_TASK_ID, color_bounds,
                               TaskArgument(NULL, 0), idx_arg_map);
   check_init_launcher.add_region_requirement(
-      RegionRequirement(lp_dc, 0, NO_ACCESS, EXCLUSIVE, lr_blis));
+      RegionRequirement(lp_dc, 0, NO_ACCESS, SIMULTANEOUS, lr_blis));
   check_init_launcher.region_requirements[0].add_field(FID_VAL);
   runtime->execute_index_space(ctx, check_init_launcher);
+#endif
 
 #if 0
   // Create primary partitioning for is_blis
@@ -248,9 +317,28 @@ fill_part_task(const Task * task,
 
   acc[*pir]=Rect<2>(Point<2>(c,0),Point<2>(c,c+5));
   pir++;
-  size_t max_size = size_t(-1) / (2 * sizeof(int));
   acc[*pir]=Rect<2>(Point<2>(c,c+5),Point<2>(c, max_size));
 }
+
+void
+fill_meta_task(const Task * task,
+  const std::vector<PhysicalRegion> & regions,
+  Context ctx,
+  HighLevelRuntime * runtime) {
+  assert(regions.size() == 1);
+  Legion::Domain dom = runtime->get_index_space_domain(
+    ctx, task->regions[0].region.get_index_space());
+
+  const FieldAccessor<WRITE_DISCARD,Rect<2>,2> acc(regions[0], FID_RECT);
+  std::size_t c = task->index_point.point_data[0];
+
+  size_t i = 0;
+  for(PointInDomainIterator<2, coord_t> itr(dom); itr(); itr++, i++) {
+     acc[*itr]=Rect<2>(Point<2>(i,c),Point<2>(i,c));
+std::cout <<"IRNA DEBUG META RECT = "<<acc.read(*itr)<<std::endl;
+  } 
+}
+
 
 void
 check_task(const Task * task,
@@ -266,47 +354,6 @@ check_task(const Task * task,
 
 } //resize_task
 
-#if 0
-
-void
-fill_task(const Task * task,
-  const std::vector<PhysicalRegion> & regions,
-  Context ctx,
-  HighLevelRuntime * runtime) {
-  assert(regions.size() == 2);
-
-  std::vector<PhysicalRegion> comb_regions;
-  comb_regions.push_back(regions[0]);
-  comb_regions.push_back(regions[1]);
-
-  Legion::Domain pr_dom = runtime->get_index_space_domain(
-    ctx, task->regions[0].region.get_index_space());
-  Legion::Domain gh_dom = runtime->get_index_space_domain(
-    ctx, task->regions[1].region.get_index_space());
-
-  const Legion::MultiRegionAccessor<size_t, 2, Legion::coord_t,
-    Realm::AffineAccessor<size_t, 2, Legion::coord_t>>
-    mrac(comb_regions, FID_VAL, sizeof(size_t));
-
-  size_t i = 0;
-  for(PointInDomainIterator<2, coord_t> itr(pr_dom); itr(); itr++, i++) {
-    // writing to primary:
-    mrac[*itr] = i;
-    i++;
-  }
-
-  for(PointInDomainIterator<2, coord_t> itr(gh_dom); itr(); itr++, i++) {
-    //reading ghost
-    size_t tmp2 = mrac[*itr];
-    // writing to ghost
-    mrac[*itr] = i;
-    i++;
-  }
- 
-
-} // fill_task
-
-#endif
 int
 main(int argc, char ** argv) {
 #if defined(GASNET_CONDUIT_MPI) || defined(REALM_USE_MPI)
@@ -354,15 +401,13 @@ main(int argc, char ** argv) {
       registrar, "check_task");
   } // scope 
 
-#if 0
   {
-    Legion::TaskVariantRegistrar registrar(FILL_TASK_ID, "fill_task");
+    Legion::TaskVariantRegistrar registrar(FILL_META_TASK_ID, "fill_meta_task");
     registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
     registrar.set_leaf();
-    Legion::Runtime::preregister_task_variant<fill_task>(
-      registrar, "fill_task");
+    Legion::Runtime::preregister_task_variant<fill_meta_task>(
+      registrar, "fill_meta_task");
   } // scope
-#endif
   {
     Legion::TaskVariantRegistrar registrar(FILL_PART_TASK_ID, "fill_part");
     registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
