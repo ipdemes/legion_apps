@@ -198,96 +198,80 @@ top_level_task(const Task * task,
       lp_part_dc,
       lr_part,//runtime->get_parent_logical_region(idx_lp),
       FID_RECT,
-      color_meta_is);
-  //    DISJOINT_COMPLETE_KIND);
+      color_meta_is,
+      DISJOINT_COMPLETE_KIND);
       
   runtime->attach_name(ip_dc, "ip_dc");
   LogicalPartition lp_dc = runtime->get_logical_partition(lr_blis, ip_dc);
   runtime->attach_name(lp_dc, "lp_dc");
 
+
+  //---------------------------------------
+  // get "used" subregion for blis and part
+  // ---------------------------------------
+  LogicalRegion lr_blis_used = runtime->get_logical_subregion_by_color(ctx, lp_dc, 0);
+  IndexSpace is_blis_used=lr_blis_used.get_index_space();
+
+  // ---------------------------------------
+  // partition lr_blis_used and lr_part_blis by colors
+  // ---------------------------------------
+
+  IndexPartition ip_blis_used_dc = runtime->create_partition_by_restriction
+    (ctx,
+    is_blis_used,
+    color_is,
+    idx_tsfm,
+    {{0,0}, {0,max_size}}, DISJOINT_COMPLETE_KIND);
+  runtime->attach_name(ip_blis_used_dc, "ip_blis_used_dc");
+  LogicalPartition lp_blis_used_dc = runtime->get_logical_partition(lr_blis_used, ip_blis_used_dc);
+  runtime->attach_name(lp_blis_used_dc, "lp_blis_used_dc");
+ 
+
+#if 0
+  LogicalRegion lr_part_used = runtime->get_logical_subregion_by_color(ctx, lp_part_dc, 0);
+  IndexSpace is_part_used=lr_part_used.get_index_space();
+
+  // ---------------------------------------
+  // partition lr_blis_used and lr_part_blis by colors
+  // ---------------------------------------
+
+  IndexPartition ip_part_used = runtime->create_partition_by_restriction
+    (ctx,
+    is_part_used,
+    color_is,
+    idx_tsfm,
+    {{0,0}, {0,0}}, DISJOINT_COMPLETE_KIND);
+  runtime->attach_name(ip_part_used, "ip_part_used");
+  LogicalPartition lp_part_used = runtime->get_logical_partition(lr_part_used, ip_part_used);
+  runtime->attach_name(lp_part_used, "lp_part_used");
+
+  IndexPartition ip_blis_used_dc = runtime->create_partition_by_image_range(
+      ctx,
+      is_blis_used,
+      lp_part_used,
+      lr_part_used,//runtime->get_parent_logical_region(idx_lp),
+      FID_RECT,
+      color_is,
+      DISJOINT_COMPLETE_KIND);
+
+  runtime->attach_name(ip_blis_used, "ip_blis_used");
+  LogicalPartition lp_blis_used = runtime->get_logical_partition(lr_blis_used, ip__blis_used_dc);
+  runtime->attach_name(lp_blis_used, "lp_blis_used");
+#endif
+
+   
+
   //----------------
   //check the partition
   //-----------------
-#if 0
+#if 1
 
   IndexLauncher check_init_launcher(CHECK_TASK_ID, color_bounds,
                               TaskArgument(NULL, 0), idx_arg_map);
   check_init_launcher.add_region_requirement(
-      RegionRequirement(lp_dc, 0, NO_ACCESS, SIMULTANEOUS, lr_blis));
+      RegionRequirement(lp_blis_used_dc, 0, NO_ACCESS, EXCLUSIVE, lr_blis_used));
   check_init_launcher.region_requirements[0].add_field(FID_VAL);
   runtime->execute_index_space(ctx, check_init_launcher);
-#endif
-
-#if 0
-  // Create primary partitioning for is_blis
-  DomainColoring pr_partitioning_blis;
-  for(size_t color = 0; color < num_colors; ++color) {
-    Rect<2> subrect(Point<2>(color, 0), Point<2>(color, num_elmts - 1));
-
-    pr_partitioning_blis[color] = subrect;
-  }
-
-  IndexPartition ip_pr = runtime->create_index_partition(
-    ctx, is_blis, color_bounds, pr_partitioning_blis, true /*disjoint*/);
-
-  LogicalPartition lp_pr =
-    runtime->get_logical_partition(ctx, lr_blis, ip_pr);
-
-  // Create ghost partitioning for is_blis
-  DomainColoring gh_partitioning_blis;
-  for(size_t color = 0; color < num_colors; ++color) {
-    Rect<2> subrect(Point<2>(color, num_elmts), Point<2>(color, num_elmts +num_ghosts - 1));
-
-    gh_partitioning_blis[color] = subrect;
-  }
-
-  IndexPartition ip_gh = runtime->create_index_partition(
-    ctx, is_blis, color_bounds, gh_partitioning_blis, true /*disjoint*/);
-
-  LogicalPartition lp_gh =
-    runtime->get_logical_partition(ctx, lr_blis, ip_gh); 
-
-
-  ArgumentMap arg_map;
-  ////////////////////////////////////////////////////////////////////////
-  // fill task
-  ////////////////////////////////////////////////////////////////////////
-  IndexLauncher fill_launcher(
-    FILL_TASK_ID, color_bounds, TaskArgument(NULL, 0), arg_map);
-
-  {
-    Legion::RegionRequirement rr1(lp_pr, 0, WRITE_DISCARD,
-      EXCLUSIVE, lr_blis);
-    rr1.add_field(FID_VAL);
-    Legion::RegionRequirement rr2(lp_gh, 0, WRITE_DISCARD,
-      EXCLUSIVE, lr_blis);
-    rr2.add_field(FID_VAL);
-    fill_launcher.add_region_requirement(rr1);
-    fill_launcher.add_region_requirement(rr2);
-  } // scope
-
-  auto future_fill = runtime->execute_index_space(ctx, fill_launcher);
-
-  ////////////////////////////////////////////////////////////////////////
-  // check task
-  ////////////////////////////////////////////////////////////////////////
-  IndexLauncher check_launcher(
-    CHECK_TASK_ID, color_bounds, TaskArgument(NULL, 0), arg_map);
-
-  {
-    Legion::RegionRequirement rr1(lp_pr, 0, READ_WRITE,
-      EXCLUSIVE, lr_blis);
-    rr1.add_field(FID_VAL);
-    Legion::RegionRequirement rr2(lp_gh, 0, READ_ONLY,
-      EXCLUSIVE, lr_blis);
-    rr2.add_field(FID_VAL);
-    check_launcher.add_region_requirement(rr1);
-    check_launcher.add_region_requirement(rr2);
-  } // scope
-
-  auto future_check = runtime->execute_index_space(ctx, check_launcher);
-
-
 #endif
 
   ///////////////////////////////////////////////////////////////////////
@@ -298,6 +282,8 @@ top_level_task(const Task * task,
   runtime->destroy_field_space(ctx, fs_blis);
   runtime->destroy_logical_region(ctx, lr_part);
   runtime->destroy_field_space(ctx, fs_part);
+  runtime->destroy_logical_region(ctx, lr_meta);
+  runtime->destroy_field_space(ctx, fs_meta);
 
   handshake.legion_handoff_to_mpi();
 }
@@ -317,7 +303,7 @@ fill_part_task(const Task * task,
 
   acc[*pir]=Rect<2>(Point<2>(c,0),Point<2>(c,c+5));
   pir++;
-  acc[*pir]=Rect<2>(Point<2>(c,c+5),Point<2>(c, max_size));
+  acc[*pir]=Rect<2>(Point<2>(c,c+5+1),Point<2>(c, max_size));
 }
 
 void
