@@ -90,6 +90,27 @@ void top_level_task(const Task *task,
   LogicalRegion lr_blis = runtime->create_logical_region(ctx, is_blis, fs_blis);
   runtime->attach_name(lr_blis, "lr_blis");
 
+  //------------------------------------------------------
+  //  For the BLIS like this:
+  //  *****-------------
+  //  ******------------
+  //  ------------------
+  //  **----------------
+  //
+  //We first, want to partition it into 2 pieces :used and unused
+  //
+  // lr_part below stores info about used/unused rectangles
+  //Rectangles:
+  //{0}×[0,5) {0}×[5,∞)
+  //{1}×[0,6) {1}×[6,∞)
+  //{2}×[0,0) {2}×[0,∞)
+  //{3}×[0,2) {3}×[2,∞)
+  //
+  //lr_meta stores information about how to partition lr_part into 2 colums (used/unused)
+  //Meta-rectangles:
+  //{0}×[0,1) {1}×[0,1) {2}×[0,1) {3}×[0,1)
+  //{0}×[1,2) {1}×[1,2) {2}×[1,2) {3}×[1,2)
+  //
   //-------------------------------------------------
   // create used/unused disjoint complete partitioning
   //-------------------------------------------------
